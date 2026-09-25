@@ -1,0 +1,142 @@
+name: "App Service QA Release & Rollback"
+
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  AZURE_SERVICE_CONNECTION: "azure-spn-service-connection" # Replace with your ADO Service Connection name
+  AZURE_WEBAPP_NAME: "app-spoke-prd"
+  RESOURCE_GROUP: "rg-spoke-prd"
+  VM_IMAGE: "ubuntu-latest"
+
+stages:
+  # ==========================================
+  # 1. BUILD & PACKAGE
+  # ==========================================
+  - stage: Build
+    displayName: "Build Package"
+    jobs:
+      - job: BuildJob
+        displayName: "Build & Test Application"
+        pool:
+          vmImage: $(VM_IMAGE)
+        steps:
+          - task: UseDotNet@2
+            displayName: "Setup .NET SDK"
+            inputs:
+              packageType: "sdk"
+              version: "8.0.x"
+
+          - script: dotnet publish -c Release -o $(Build.ArtifactStagingDirectory)/publish-output
+            displayName: "Publish Application"
+
+          - task: PublishBuildArtifacts@1
+            displayName: "Upload Package Artifact"
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)/publish-output"
+              ArtifactName: "app-package"
+              publishLocation: "Container"
+
+  # ==========================================
+  # 2. DEPLOY TO STAGING FOR QA
+  # ==========================================
+  - stage: DeployStaging
+    displayName: "Deploy to Staging"
+    dependsOn: Build
+    jobs:
+      - deployment: DeployStagingJob
+        displayName: "Deploy to Staging (QA Environment)"
+        pool:
+          vmImage: $(VM_IMAGE)
+        environment: "staging" # Links to ADO Environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureWebApp@1
+                  displayName: "Deploy Package to Staging Slot"
+                  inputs:
+                    azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+                    appType: "webAppLinux"
+                    appName: "$(AZURE_WEBAPP_NAME)"
+                    deployToSlotOrASE: true
+                    resourceGroupName: "$(RESOURCE_GROUP)"
+                    slotName: "staging"
+                    package: "$(Pipeline.Workspace)/app-package"
+
+  # ==========================================
+  # 3. SWAP TO PRODUCTION (QA GATE ATTACHED TO ENVIRONMENT)
+  # ==========================================
+  - stage: PromoteProduction
+    displayName: "Swap to Production"
+    dependsOn: DeployStaging
+    jobs:
+      # Job 1: Manual QA Approval Gate via ADO Environment
+      - deployment: ProductionSwap
+        displayName: "Swap Staging to Production"
+        pool:
+          vmImage: $(VM_IMAGE)
+        # Configure Manual Approvals on the 'production' Environment in ADO UI
+        environment: "production" 
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureCLI@2
+                  displayName: "Swap Staging to Production (Azure CLI)"
+                  inputs:
+                    azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+                    scriptType: "bash"
+                    scriptLocation: "inlineScript"
+                    inlineScript: |
+                      az webapp deployment slot swap \
+                        --resource-group $(RESOURCE_GROUP) \
+                        --name $(AZURE_WEBAPP_NAME) \
+                        --slot staging \
+                        --target-slot production
+
+      # Job 2: Post-Swap Smoke Test
+      - job: SmokeTest
+        displayName: "Production Smoke Test"
+        dependsOn: ProductionSwap
+        pool:
+          vmImage: $(VM_IMAGE)
+        steps:
+          - script: |
+              PROD_URL="https://$(AZURE_WEBAPP_NAME).azurewebsites.net/healthz"
+              echo "Testing Production Health: $PROD_URL"
+              
+              STATUS=\((curl -s -o /dev/null -w "%{http_code}" --max-time 10 "\)PROD_URL")
+              
+              if [ "$STATUS" -eq 200 ]; then
+                echo "Production is healthy (HTTP 200)!"
+                exit 0
+              else
+                echo "Production failed with HTTP status: $STATUS"
+                exit 1
+              fi
+            displayName: "Probe Production Endpoint"
+
+      # Job 3: Auto-Rollback (Runs ONLY if SmokeTest Fails)
+      - job: AutoRollback
+        displayName: "Auto-Rollback Production"
+        dependsOn: SmokeTest
+        condition: failed() # Triggers automatically when SmokeTest fails
+        pool:
+          vmImage: $(VM_IMAGE)
+        steps:
+          - task: AzureCLI@2
+            displayName: "Execute Swap Back via Azure CLI"
+            inputs:
+              azureSubscription: "$(AZURE_SERVICE_CONNECTION)"
+              scriptType: "bash"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo "CRITICAL: Smoke test failed. Swapping back to restore previous build..."
+                az webapp deployment slot swap \
+                  --resource-group $(RESOURCE_GROUP) \
+                  --name $(AZURE_WEBAPP_NAME) \
+                  --slot staging \
+                  --target-slot production
