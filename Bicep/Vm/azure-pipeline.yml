@@ -1,0 +1,13 @@
+trigger:
+  - main
+  - feature/*
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+
+steps:
+- task:
+  displayname:
+  inputs:

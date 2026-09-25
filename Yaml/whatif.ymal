@@ -1,0 +1,77 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+    pool:
+      vmImage: 'ubuntu-latest'
+
+variables:
+  azureServiceConnection: 'sc-azure-prod-oidc'
+  resourceGroupName: 'rg-app-prod'
+  bicepFile: '$(System.DefaultWorkingDirectory)/infra/main.bicep'
+  parameterFile: '$(System.DefaultWorkingDirectory)/infra/main.prod.bicepparam'
+
+parameters:
+ - name: whatIf
+   displayName: Dry Run
+   type: boolean
+   default: true
+ 
+ - name: deploy
+   displayName: Deployment
+   type: boolean
+   default: false
+
+stages:
+# STAGE 1: Runs on both Pull Requests AND Main Branch
+- stage: Validate
+  displayName: 'Validation & Dry-Run'
+  condition: eq('${{parameters.whatIf}}', 'true') #${{parameters.whatIf}} this ensure that no tasks are run untill this parameter is filled
+  jobs:
+  - job: WhatIfJob
+    displayName: 'Run What-If'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Execute What-If'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az deployment group what-if \ 
+            --resource-group "$(resourceGroupName)" \
+            --template-file "$(bicepFile)" \
+            --parameters "$(parameterFile)"
+#  az deployment group what-if  outputs what is expected to be chagned e.g. plus, add and other operations
+#  STAGE 2: Only runs when code is merged to 'main' and when boolean for deploy is true
+- stage: Deploy
+  displayName: 'Deploy Infrastructure'
+  dependsOn: Validate # Validate is considered parent stage as Deploy depends on it 
+  condition: and(
+    succeededOrSkipped(),
+    eq(variables['Build.SourceBranch'], 'refs/heads/main'),
+    eq('${{ parameters.deploy }}', 'true')
+  )
+#succeededOrSkipped() is stating that if "Validate"(dependson) is either skipped or succeeded but if it fails this stage will not run 
+#${{parameters.deploy}} this ensure that no tasks are run untill this parameter is filled
+  jobs:
+  - job: DeployJob
+    displayName: 'Execute Deployment'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Execute Create'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          az deployment group create \
+            --resource-group "$(resourceGroupName)" \
+            --template-file "$(bicepFile)" \
+            --parameters "$(parameterFile)"
