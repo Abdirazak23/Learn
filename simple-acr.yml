@@ -1,0 +1,43 @@
+name: Simple Artifact Test Pipeline
+
+trigger:
+  - main
+
+stages:
+  # 1. CI STAGE: Build & Upload
+  - stage: CI_Build
+    displayName: "CI: Build & Package"
+    jobs:
+      - job: BuildJob
+        runs-on: ubuntu-latest
+        steps:
+          - script: |
+              mkdir -p $(Build.ArtifactStagingDirectory)/publish
+              echo "Hello from ADO Build ID: \((Build.BuildId)" >\)(Build.ArtifactStagingDirectory)/publish/app-version.txt
+            displayName: "Create Test File"
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              PathtoPublish: "$(Build.ArtifactStagingDirectory)/publish"
+              ArtifactName: "my-test-artifact"
+              publishLocation: "Container"
+
+  # 2. CD STAGE: Download & Verify
+  - stage: CD_Deploy
+    displayName: "CD: Download & Verify"
+    dependsOn: CI_Build # Waits for CI stage to complete
+    jobs:
+      - job: DeployJob
+        runs-on: ubuntu-latest
+        steps:
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: "current"
+              downloadType: "single"
+              artifactName: "my-test-artifact"
+              downloadPath: "$(System.ArtifactsDirectory)"
+
+          - script: |
+              echo "=== Downloaded Artifact Content ==="
+              cat $(System.ArtifactsDirectory)/my-test-artifact/app-version.txt
+            displayName: "Verify Downloaded File"
